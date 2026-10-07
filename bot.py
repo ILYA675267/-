@@ -1,7 +1,7 @@
 """Telegram-бот для постов с товарами.
 
 Что умеет:
-  1. Принимает фото товара → убирает фон → ставит товар по центру на твой фон.
+  1. Принимает фото товара (одно или альбом до 10 штук) → убирает фон → ставит товар по центру на твой фон.
   2. Показывает готовый пост и кнопки с темами группы → публикует в выбранную тему.
 
 Команды в личке с ботом:
@@ -24,7 +24,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv, set_key
 from PIL import Image
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Message, Update
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes,
                           MessageHandler, filters)
 
@@ -44,7 +44,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("bot")
 
 HELP = (
-    "Пришли мне фото товара, а описание напиши в подписи к фото.\n"
+    "Пришли мне фото товара (можно сразу несколько, до 10), а описание напиши в подписи.\n"
     "Я уберу фон, поставлю товар на твой фон и спрошу, в какую тему опубликовать.\n\n"
     "Как научить меня темам группы:\n"
     "1) добавь меня в группу администратором;\n"
@@ -203,17 +203,20 @@ async def topic_changed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 # ---------- Фото товара → готовый пост ----------
 
-async def download_image(update: Update) -> bytes:
-    msg = update.message
+ALBUM_WAIT = 2.0   # сколько секунд ждать остальные фото альбома
+MAX_PHOTOS = 10    # больше 10 фото в одном посте Telegram не позволяет
+
+
+async def download_image(msg: Message) -> bytes:
     file = await (msg.document.get_file() if msg.document else msg.photo[-1].get_file())
     return bytes(await file.download_as_bytearray())
 
 
-async def save_background(update: Update, data: bytes) -> None:
+async def save_background(msg: Message, data: bytes) -> None:
     img = Image.open(BytesIO(data)).convert("RGB")
     img.thumbnail((2000, 2000), Image.LANCZOS)  # слишком большие уменьшаем
     img.save(BACKGROUND, "JPEG", quality=95)
-    await update.message.reply_text(f"Готово! Новый фон сохранён ({img.width}×{img.height}).")
+    await msg.reply_text(f"Готово! Новый фон сохранён ({img.width}×{img.height}).")
 
 
 def post_markup(post_id: str) -> InlineKeyboardMarkup:
@@ -225,47 +228,104 @@ def post_markup(post_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def album(photos: list, caption: str) -> list[InputMediaPhoto]:
+    """Альбом для отправки: подпись ставится к первому фото — так Telegram показывает её под всем постом."""
+    return [InputMediaPhoto(p, caption=(caption or None) if i == 0 else None)
+            for i, p in enumerate(photos)]
+
+
+async def send_post(bot, chat_id: int, photos: list, caption: str,
+                    thread_id: int | None = None, markup: InlineKeyboardMarkup | None = None) -> list[str]:
+    """Отправляет пост (одно фото или альбом). Возвращает file_id отправленных фото.
+    Если передать markup — под одиночным фото будут кнопки, а у альбома — отдельным сообщением."""
+    if len(photos) == 1:
+        sent = [await bot.send_photo(chat_id, photos[0], caption=caption or None,
+                                     message_thread_id=thread_id, reply_markup=markup)]
+    else:
+        sent = await bot.send_media_group(chat_id, album(photos, caption), message_thread_id=thread_id)
+        if markup:
+            await bot.send_message(chat_id, f"👆 Пост из {len(photos)} фото. Куда опубликовать?",
+                                   reply_markup=markup)
+    return [m.photo[-1].file_id for m in sent]
+
+
 async def on_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await is_owner(update):
         return
+    msg = update.message
 
-    data = await download_image(update)
-    if context.user_data.get("waiting_for") == "background":
-        await save_background(update, data)
-        context.user_data.pop("waiting_for", None)
+    if not msg.media_group_id:          # одно фото — обрабатываем сразу
+        await make_post(context, [msg])
         return
 
-    if not BACKGROUND.exists():
-        await update.message.reply_text("Сначала пришли мне фон: команда /фон")
-        return
-    status = await update.message.reply_text("Обрабатываю фото… (первый раз может занять минуту)")
+    # Несколько фото за раз приходят по одному, но с общим media_group_id.
+    # Собираем их и ждём ALBUM_WAIT секунд после последнего, потом обрабатываем все вместе.
+    albums = context.user_data.setdefault("albums", {})
+    entry = albums.setdefault(msg.media_group_id, {"msgs": [], "task": None})
+    entry["msgs"].append(msg)
+    if entry["task"]:
+        entry["task"].cancel()
+    entry["task"] = context.application.create_task(finish_album(context, msg.media_group_id))
+
+
+async def finish_album(context: ContextTypes.DEFAULT_TYPE, group_id: str) -> None:
     try:
-        # Тяжёлую работу делаем в отдельном потоке, чтобы бот не «зависал»
-        result = await asyncio.to_thread(make_product_photo, data, BACKGROUND)
-    except Exception:
-        log.exception("Ошибка обработки фото")
-        await status.edit_text("Не получилось обработать фото 😕 Попробуй другое.")
+        await asyncio.sleep(ALBUM_WAIT)
+    except asyncio.CancelledError:
+        return  # пришло ещё фото — ждём дальше
+    entry = context.user_data.get("albums", {}).pop(group_id, None)
+    if entry:
+        msgs = sorted(entry["msgs"], key=lambda m: m.message_id)
+        await make_post(context, msgs)
+
+
+async def make_post(context: ContextTypes.DEFAULT_TYPE, msgs: list[Message]) -> None:
+    """Обрабатывает одно или несколько фото и показывает готовый пост с кнопками."""
+    first = msgs[0]
+    chat_id = first.chat_id
+
+    if context.user_data.get("waiting_for") == "background":
+        context.user_data.pop("waiting_for", None)
+        await save_background(first, await download_image(first))
+        return
+    if not BACKGROUND.exists():
+        await first.reply_text("Сначала пришли мне фон: команда /фон")
         return
 
-    caption = (update.message.caption or "")[:1024]
+    if len(msgs) > MAX_PHOTOS:
+        await first.reply_text(f"В одном посте можно максимум {MAX_PHOTOS} фото — возьму первые {MAX_PHOTOS}.")
+        msgs = msgs[:MAX_PHOTOS]
+
+    caption = next((m.caption for m in msgs if m.caption), "")[:1024]
+    total = len(msgs)
+    status = await first.reply_text("Обрабатываю фото… (первый раз может занять минуту)")
+
+    results = []
+    for i, m in enumerate(msgs, 1):
+        if total > 1:
+            await status.edit_text(f"Обрабатываю фото {i} из {total}…")
+        try:
+            data = await download_image(m)
+            # Тяжёлую работу делаем в отдельном потоке, чтобы бот не «зависал»
+            results.append(await asyncio.to_thread(make_product_photo, data, BACKGROUND))
+        except Exception:
+            log.exception("Ошибка обработки фото")
+            await first.reply_text(f"Фото {i} не получилось обработать 😕 Пропускаю его.")
+    await status.delete()
+    if not results:
+        return
+
     context.user_data["post_counter"] = context.user_data.get("post_counter", 0) + 1
     post_id = str(context.user_data["post_counter"])
-
-    preview = await update.message.reply_photo(result, caption=caption or None,
-                                               reply_markup=post_markup(post_id))
-    context.user_data.setdefault("posts", {})[post_id] = {
-        "file_id": preview.photo[-1].file_id,
-        "caption": caption,
-    }
-    await status.delete()
+    file_ids = await send_post(context.bot, chat_id, results, caption, markup=post_markup(post_id))
+    context.user_data.setdefault("posts", {})[post_id] = {"file_ids": file_ids, "caption": caption}
 
     if not load_topics():
-        await update.message.reply_text(
+        await context.bot.send_message(chat_id,
             "Я пока не знаю тем группы. Добавь меня в группу админом, "
-            "зайди в нужную тему и напиши там /тема — потом кнопки появятся."
-        )
+            "зайди в нужную тему и напиши там /тема — потом кнопки появятся.")
     elif not caption:
-        await update.message.reply_text("Описания нет. Нажми «✏️ Изменить текст», чтобы добавить.")
+        await context.bot.send_message(chat_id, "Описания нет. Нажми «✏️ Изменить текст», чтобы добавить.")
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -282,8 +342,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
         post["caption"] = update.message.text[:1024]
         # Присылаем обновлённый пост заново, с теми же кнопками
-        await update.message.reply_photo(post["file_id"], caption=post["caption"],
-                                         reply_markup=post_markup(post_id))
+        await send_post(context.bot, update.effective_chat.id, post["file_ids"], post["caption"],
+                        markup=post_markup(post_id))
         return
 
     await update.message.reply_text("Пришли фото товара 📷\n\n" + HELP)
@@ -320,9 +380,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await query.answer("Такой темы больше нет.", show_alert=True)
             return
         try:
-            await context.bot.send_photo(topic["chat_id"], post["file_id"],
-                                         caption=post["caption"] or None,
-                                         message_thread_id=topic["thread_id"])
+            await send_post(context.bot, topic["chat_id"], post["file_ids"], post["caption"],
+                            thread_id=topic["thread_id"])
         except Exception as e:
             log.exception("Не получилось опубликовать")
             await query.answer(f"Не получилось опубликовать: {e}", show_alert=True)
