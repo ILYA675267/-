@@ -30,6 +30,8 @@ from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, Con
 
 from image_processing import make_product_photo
 
+VERSION = "3 — несколько фото в одном посте"
+
 BASE_DIR = Path(__file__).resolve().parent
 TEMPLATES = BASE_DIR / "templates"
 BACKGROUND = TEMPLATES / "background.jpg"
@@ -52,7 +54,8 @@ HELP = (
     "Команды:\n"
     "/темы — какие темы я знаю\n"
     "/фон — заменить фон\n"
-    "/отмена — отменить"
+    "/отмена — отменить\n\n"
+    f"Версия бота: {VERSION}"
 )
 
 PRIVATE = filters.ChatType.PRIVATE
@@ -254,18 +257,15 @@ async def on_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     msg = update.message
 
-    if not msg.media_group_id:          # одно фото — обрабатываем сразу
-        await make_post(context, [msg])
-        return
-
-    # Несколько фото за раз приходят по одному, но с общим media_group_id.
-    # Собираем их и ждём ALBUM_WAIT секунд после последнего, потом обрабатываем все вместе.
+    # Несколько фото за раз Telegram присылает по одному сообщению.
+    # Поэтому все фото, пришедшие подряд с паузой меньше ALBUM_WAIT секунд,
+    # собираем в один пост (неважно, альбомом их отправили или по отдельности).
     albums = context.user_data.setdefault("albums", {})
-    entry = albums.setdefault(msg.media_group_id, {"msgs": [], "task": None})
+    entry = albums.setdefault("pending", {"msgs": [], "task": None})
     entry["msgs"].append(msg)
     if entry["task"]:
         entry["task"].cancel()
-    entry["task"] = context.application.create_task(finish_album(context, msg.media_group_id))
+    entry["task"] = context.application.create_task(finish_album(context, "pending"))
 
 
 async def finish_album(context: ContextTypes.DEFAULT_TYPE, group_id: str) -> None:
@@ -429,7 +429,7 @@ def main() -> None:
     # Кнопки
     app.add_handler(CallbackQueryHandler(on_button))
 
-    log.info("Бот запущен. Останови его: Ctrl+C")
+    log.info("Бот запущен (версия %s). Останови его: Ctrl+C", VERSION)
     app.run_polling()
 
 
